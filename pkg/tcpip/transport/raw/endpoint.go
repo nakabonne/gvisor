@@ -68,6 +68,7 @@ type endpoint struct {
 	netProto    tcpip.NetworkProtocolNumber
 	transProto  tcpip.TransportProtocolNumber
 	waiterQueue *waiter.Queue
+	stats       tcpip.TransportEndpointStats
 	associated  bool
 
 	// The following fields are used to manage the receive queue and are
@@ -187,6 +188,7 @@ func (ep *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMes
 	if ep.rcvList.Empty() {
 		err := tcpip.ErrWouldBlock
 		if ep.rcvClosed {
+			ep.stats.ReadErrors.ReadClosed.Increment()
 			err = tcpip.ErrClosedForReceive
 		}
 		ep.rcvMu.Unlock()
@@ -217,6 +219,7 @@ func (ep *endpoint) Write(payload tcpip.Payload, opts tcpip.WriteOptions) (int64
 
 	if ep.closed {
 		ep.mu.RUnlock()
+		ep.stats.WriteErrors.WriteClosed.Increment()
 		return 0, nil, tcpip.ErrInvalidEndpointState
 	}
 
@@ -273,12 +276,22 @@ func (ep *endpoint) Write(payload tcpip.Payload, opts tcpip.WriteOptions) (int64
 
 			n, ch, err := ep.finishWrite(payloadBytes, savedRoute)
 			ep.mu.Unlock()
-			return n, ch, err
+			if err != nil {
+				ep.stats.SendErrors.SendErrors.Increment()
+				return 0, nil, err
+			}
+			ep.stats.PacketsSent.Increment()
+			return n, ch, nil
 		}
 
 		n, ch, err := ep.finishWrite(payloadBytes, &ep.route)
 		ep.mu.RUnlock()
-		return n, ch, err
+		if err != nil {
+			ep.stats.SendErrors.SendErrors.Increment()
+			return 0, nil, err
+		}
+		ep.stats.PacketsSent.Increment()
+		return n, ch, nil
 	}
 
 	// The caller provided a destination. Reject destination address if it
@@ -286,6 +299,7 @@ func (ep *endpoint) Write(payload tcpip.Payload, opts tcpip.WriteOptions) (int64
 	nic := opts.To.NIC
 	if ep.bound && nic != 0 && nic != ep.boundNIC {
 		ep.mu.RUnlock()
+		ep.stats.SendErrors.NoRoute.Increment()
 		return 0, nil, tcpip.ErrNoRoute
 	}
 
@@ -300,13 +314,19 @@ func (ep *endpoint) Write(payload tcpip.Payload, opts tcpip.WriteOptions) (int64
 	route, err := ep.stack.FindRoute(nic, ep.boundAddr, opts.To.Addr, ep.netProto, false)
 	if err != nil {
 		ep.mu.RUnlock()
+		ep.stats.SendErrors.NoRoute.Increment()
 		return 0, nil, err
 	}
 
 	n, ch, err := ep.finishWrite(payloadBytes, &route)
 	route.Release()
 	ep.mu.RUnlock()
-	return n, ch, err
+	if err != nil {
+		ep.stats.SendErrors.SendErrors.Increment()
+		return 0, nil, err
+	}
+	ep.stats.PacketsSent.Increment()
+	return n, ch, nil
 }
 
 // finishWrite writes the payload to a route. It resolves the route if
@@ -542,9 +562,17 @@ func (ep *endpoint) HandlePacket(route *stack.Route, netHeader buffer.View, vv b
 	ep.rcvMu.Lock()
 
 	// Drop the packet if our buffer is currently full.
-	if ep.rcvClosed || ep.rcvBufSize >= ep.rcvBufSizeMax {
-		ep.stack.Stats().DroppedPackets.Increment()
+	if ep.rcvClosed {
 		ep.rcvMu.Unlock()
+		ep.stack.Stats().DroppedPackets.Increment()
+		ep.stats.ReceiveErrors.ClosedReceiver.Increment()
+		return
+	}
+
+	if ep.rcvBufSize >= ep.rcvBufSizeMax {
+		ep.rcvMu.Unlock()
+		ep.stack.Stats().DroppedPackets.Increment()
+		ep.stats.ReceiveErrors.ReceiveBufferOverflow.Increment()
 		return
 	}
 
@@ -587,7 +615,7 @@ func (ep *endpoint) HandlePacket(route *stack.Route, netHeader buffer.View, vv b
 	ep.rcvBufSize += packet.data.Size()
 
 	ep.rcvMu.Unlock()
-
+	ep.stats.PacketsReceived.Increment()
 	// Notify waiters that there's data to be read.
 	if wasEmpty {
 		ep.waiterQueue.Notify(waiter.EventIn)
