@@ -24,11 +24,13 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -1712,6 +1714,91 @@ func TestNICForwarding(t *testing.T) {
 
 	if got, want := s.NICInfo()[2].Stats.Tx.Bytes.Value(), uint64(len(buf)); got != want {
 		t.Errorf("got Tx.Bytes.Value() = %d, want = %d", got, want)
+	}
+}
+
+// TestNICAutoGenAddr tests the auto-generation of IPv6 link-local addresses
+// (or lack there-of if disabled (default)), with and without DAD.
+func TestNICAutoGenAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		autoGen  bool
+		dad      bool
+		linkAddr tcpip.LinkAddress
+	}{
+		{
+			"Disabled",
+			false,
+			false,
+			linkAddr1,
+		},
+		{
+			"Enabled w/o DAD",
+			true,
+			false,
+			linkAddr1,
+		},
+		{
+			"Enabled w/ DAD",
+			true,
+			true,
+			linkAddr1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lladdr := header.LinkLocalAddr(test.linkAddr)
+
+			opts := stack.Options{}
+
+			if test.autoGen {
+				// Only set opts.AutoGenIPv6LinkLocal when
+				// test.autoGen is true because
+				// opts.AutoGenIPv6LinkLocal should be false by
+				// default.
+				opts.AutoGenIPv6LinkLocal = true
+			}
+
+			opts.NDPConfigs.RetransTimer = time.Second
+
+			if test.dad {
+				opts.NDPConfigs.DupAddrDetectTransmits = 1
+			} else {
+				opts.NDPConfigs.DupAddrDetectTransmits = 0
+			}
+
+			e := channel.New(10, 1280, test.linkAddr)
+			s := stack.New([]string{ipv6.ProtocolName}, []string{}, opts)
+			if err := s.CreateNIC(1, e); err != nil {
+				t.Fatalf("CreateNIC(_) = %s", err)
+			}
+
+			if test.dad {
+				// Address should not be considered bound to the
+				// NIC yet (DAD ongoing).
+				if addr, err := s.GetMainNICAddress(1, header.IPv6ProtocolNumber); err != tcpip.ErrNoLinkAddress {
+					t.Fatalf("stack.GetMainNICAddress(_, _) = %s, %s", addr, err)
+				}
+
+				// Wait for the address to resolve (an extra
+				// 250ms to make sure the address resolves).
+				<-time.After(time.Second + 250*time.Millisecond)
+			}
+
+			if test.autoGen {
+				// Should have auto-generated an address and
+				// resolved (if DAD)
+				if addr, err := s.GetMainNICAddress(1, header.IPv6ProtocolNumber); err != nil || addr.Address != lladdr {
+					t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, %s), want = (%s, nil)", addr, err, lladdr)
+				}
+			} else {
+				// Should not have auto-generated an address.
+				if addr, err := s.GetMainNICAddress(1, header.IPv6ProtocolNumber); err != tcpip.ErrNoLinkAddress {
+					t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, %s), want = (, tcpip.ErrNoLinkAddress)", addr, err, lladdr)
+				}
+			}
+		})
 	}
 }
 
