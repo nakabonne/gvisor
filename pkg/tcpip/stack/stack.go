@@ -394,6 +394,9 @@ type Stack struct {
 	// icmpRateLimiter is a global rate limiter for all ICMP messages generated
 	// by the stack.
 	icmpRateLimiter *ICMPRateLimiter
+
+	// ndpConfigs is the NDP configurations used by interfaces.
+	ndpConfigs NDPConfigurations
 }
 
 // Options contains optional Stack configuration.
@@ -413,10 +416,20 @@ type Options struct {
 
 	// Raw indicates whether raw sockets may be created.
 	Raw bool
+
+	// NDPConfigs is the NDP configurations used by interfaces.
+	//
+	// By default, NDPConfigs will have a zero value for its
+	// DupAddrDetectTransmits field, implying that DAD will not be performed
+	// before assigning an address to a NIC.
+	NDPConfigs NDPConfigurations
 }
 
 // New allocates a new networking stack with only the requested networking and
 // transport protocols configured with default options.
+//
+// Note, NDPConfigurations will be fixed before being used by the Stack. That
+// is, if an invalid value was provided, it will be reset to the default value.
 //
 // Protocol options can be changed by calling the
 // SetNetworkProtocolOption/SetTransportProtocolOption methods provided by the
@@ -427,6 +440,9 @@ func New(network []string, transport []string, opts Options) *Stack {
 	if clock == nil {
 		clock = &tcpip.StdClock{}
 	}
+
+	// Fix up NDP Configurations if there are any issues.
+	opts.NDPConfigs.fix()
 
 	s := &Stack{
 		transportProtocols: make(map[tcpip.TransportProtocolNumber]*transportProtocolState),
@@ -440,6 +456,7 @@ func New(network []string, transport []string, opts Options) *Stack {
 		handleLocal:        opts.HandleLocal,
 		raw:                opts.Raw,
 		icmpRateLimiter:    NewICMPRateLimiter(),
+		ndpConfigs:         opts.NDPConfigs,
 	}
 
 	// Add specified network protocols.
@@ -1233,4 +1250,25 @@ func (s *Stack) SetICMPBurst(burst int) {
 // ICMP message to be sent at this instant.
 func (s *Stack) AllowICMPMessage() bool {
 	return s.icmpRateLimiter.Allow()
+}
+
+// IsAddrTentative returns true if addr is tentative on the NIC with ID id.
+func (s *Stack) IsAddrTentative(id tcpip.NICID, addr tcpip.Address) (bool, *tcpip.Error) {
+	nic := s.nics[id]
+	if nic == nil {
+		return false, tcpip.ErrUnknownNICID
+	}
+
+	return nic.isAddrTentative(addr), nil
+}
+
+// DupTentativeAddrDetected attempts to inform the NIC with ID id that a
+// tentative addr on it is a duplicate on a link.
+func (s *Stack) DupTentativeAddrDetected(id tcpip.NICID, addr tcpip.Address) *tcpip.Error {
+	nic := s.nics[id]
+	if nic == nil {
+		return tcpip.ErrUnknownNICID
+	}
+
+	return nic.dupTentativeAddrDetected(addr)
 }

@@ -45,6 +45,8 @@ type NIC struct {
 	mcastJoins    map[NetworkEndpointID]int32
 
 	stats NICStats
+
+	ndp NDPState
 }
 
 // NICStats includes transmitted and received stats.
@@ -99,6 +101,7 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, loopback
 				Bytes:   &tcpip.StatCounter{},
 			},
 		},
+		ndp: newNDPState(),
 	}
 }
 
@@ -306,7 +309,7 @@ func (n *NIC) addPermanentAddressLocked(protocolAddress tcpip.ProtocolAddress, p
 	id := NetworkEndpointID{protocolAddress.AddressWithPrefix.Address}
 	if ref, ok := n.endpoints[id]; ok {
 		switch ref.getKind() {
-		case permanent:
+		case permanentTentative, permanent:
 			// The NIC already have a permanent endpoint with that address.
 			return nil, tcpip.ErrDuplicateAddress
 		case permanentExpired, temporary:
@@ -322,6 +325,7 @@ func (n *NIC) addPermanentAddressLocked(protocolAddress tcpip.ProtocolAddress, p
 			n.removeEndpointLocked(ref)
 		}
 	}
+
 	return n.addAddressLocked(protocolAddress, peb, permanent)
 }
 
@@ -343,6 +347,15 @@ func (n *NIC) addAddressLocked(protocolAddress tcpip.ProtocolAddress, peb Primar
 	if err != nil {
 		return nil, err
 	}
+
+	isIPv6Unicast := protocolAddress.Protocol == header.IPv6ProtocolNumber && !header.IsV6MulticastAddress(protocolAddress.AddressWithPrefix.Address)
+
+	// If the address is an IPv6 address and it is a permanent address,
+	// mark it as tentative so it goes through the DAD process.
+	if isIPv6Unicast {
+		kind = permanentTentative
+	}
+
 	ref := &referencedNetworkEndpoint{
 		refs:     1,
 		ep:       ep,
@@ -360,7 +373,7 @@ func (n *NIC) addAddressLocked(protocolAddress tcpip.ProtocolAddress, peb Primar
 
 	// If we are adding an IPv6 address, join the solicited-node multicast
 	// address for a unicast protocolAddress.
-	if protocolAddress.Protocol == header.IPv6ProtocolNumber && !header.IsV6MulticastAddress(protocolAddress.AddressWithPrefix.Address) {
+	if isIPv6Unicast {
 		snmc := header.SolicitedNodeAddr(protocolAddress.AddressWithPrefix.Address)
 		if err := n.joinGroupLocked(protocolAddress.Protocol, snmc); err != nil {
 			return nil, err
@@ -380,6 +393,11 @@ func (n *NIC) addAddressLocked(protocolAddress tcpip.ProtocolAddress, peb Primar
 		l.PushBack(ref)
 	case FirstPrimaryEndpoint:
 		l.PushFront(ref)
+	}
+
+	// If we are adding a tentative IPv6 address, start DAD.
+	if isIPv6Unicast && kind == permanentTentative {
+		n.ndp.startDuplicateAddressDetection(n, protocolAddress.AddressWithPrefix.Address, ref)
 	}
 
 	return ref, nil
@@ -402,10 +420,11 @@ func (n *NIC) Addresses() []tcpip.ProtocolAddress {
 	defer n.mu.RUnlock()
 	addrs := make([]tcpip.ProtocolAddress, 0, len(n.endpoints))
 	for nid, ref := range n.endpoints {
-		// Don't include expired or tempory endpoints to avoid confusion and
-		// prevent the caller from using those.
+		// Don't include tentative, expired or tempory endpoints to
+		// avoid confusion and prevent the caller from using those.
 		switch ref.getKind() {
-		case permanentExpired, temporary:
+		case permanentTentative, permanentExpired, temporary:
+			// TODO(ghanan): Should tentative addresses be returned?
 			continue
 		}
 		addrs = append(addrs, tcpip.ProtocolAddress{
@@ -496,7 +515,7 @@ func (n *NIC) removeEndpoint(r *referencedNetworkEndpoint) {
 
 func (n *NIC) removePermanentAddressLocked(addr tcpip.Address) *tcpip.Error {
 	r, ok := n.endpoints[NetworkEndpointID{addr}]
-	if !ok || r.getKind() != permanent {
+	if !ok || (r.getKind() != permanent && r.getKind() != permanentTentative) {
 		return tcpip.ErrBadLocalAddress
 	}
 
@@ -515,6 +534,8 @@ func (n *NIC) removePermanentAddressLocked(addr tcpip.Address) *tcpip.Error {
 		if err := n.leaveGroupLocked(snmc); err != nil {
 			return err
 		}
+
+		n.ndp.stopDuplicateAddressDetection(n, addr)
 	}
 
 	return nil
@@ -784,14 +805,54 @@ func (n *NIC) Stack() *Stack {
 	return n.stack
 }
 
+// isAddrTentative returns true if addr is tentative on n.
+func (n *NIC) isAddrTentative(addr tcpip.Address) bool {
+	ref, ok := n.endpoints[NetworkEndpointID{addr}]
+	if !ok {
+		return false
+	}
+
+	return ref.kind == permanentTentative
+}
+
+// dupTentativeAddrDetected attempts to inform n that a tentative addr
+// is a duplicate on a link.
+//
+// dupTentativeAddrDetected will delete the tentative address if it exists.
+func (n *NIC) dupTentativeAddrDetected(addr tcpip.Address) *tcpip.Error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	ref, ok := n.endpoints[NetworkEndpointID{addr}]
+	if !ok {
+		return tcpip.ErrBadAddress
+	}
+
+	if ref.kind != permanentTentative {
+		return tcpip.ErrInvalidEndpointState
+	}
+
+	return n.removePermanentAddressLocked(addr)
+}
+
 type networkEndpointKind int32
 
 const (
+	// A permanentTentative endpoint is a permanent address that is not yet
+	// considered to be fully bound to an interface in the traditional
+	// sense. That is, the address is associated with a NIC, but packets
+	// destined to the address MUST NOT be accepted and MUST be silently
+	// dropped, and the address MUST NOT be used as a source address for
+	// outgoing packets. For IPv6, addresses will be of this kind until
+	// NDP's Duplicate Address Detection has resolved, or be deleted if
+	// the process results in detecting a duplicate address.
+	permanentTentative networkEndpointKind = iota
+
 	// A permanent endpoint is created by adding a permanent address (vs. a
 	// temporary one) to the NIC. Its reference count is biased by 1 to avoid
 	// removal when no route holds a reference to it. It is removed by explicitly
 	// removing the permanent address from the NIC.
-	permanent networkEndpointKind = iota
+	permanent
 
 	// An expired permanent endoint is a permanent endoint that had its address
 	// removed from the NIC, and it is waiting to be removed once no more routes
