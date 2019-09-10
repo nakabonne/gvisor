@@ -295,6 +295,9 @@ type LinkEndpoint interface {
 	// IsAttached returns whether a NetworkDispatcher is attached to the
 	// endpoint.
 	IsAttached() bool
+
+	// Wait waits for any worker goroutines owned by the endpoint to stop.
+	Wait()
 }
 
 // InjectableLinkEndpoint is a LinkEndpoint where inbound packets are

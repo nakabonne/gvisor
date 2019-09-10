@@ -104,6 +104,9 @@ func (m *InjectableEndpoint) WriteRawPacket(dest tcpip.Address, packet []byte) *
 	return endpoint.WriteRawPacket(dest, packet)
 }
 
+// Wait implements stack.LinkEndpoint.Wait.
+func (*InjectableEndpoint) Wait() {}
+
 // NewInjectableEndpoint creates a new multi-endpoint injectable endpoint.
 func NewInjectableEndpoint(routes map[tcpip.Address]stack.InjectableLinkEndpoint) *InjectableEndpoint {
 	return &InjectableEndpoint{
