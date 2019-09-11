@@ -25,6 +25,13 @@ import (
 type ICMPv6 []byte
 
 const (
+	// ICMPv6HeaderSize is the size of the ICMPv6 header. That is, the
+	// sum of the size of the ICMPv6 Type, Code and Checksum fields.
+	ICMPv6HeaderSize = 4
+
+	// ICMPv6BodyOffset is the offset of the body of an ICMPv6 packet.
+	ICMPv6BodyOffset = 4
+
 	// ICMPv6MinimumSize is the minimum size of a valid ICMP packet.
 	ICMPv6MinimumSize = 8
 
@@ -37,10 +44,15 @@ const (
 
 	// ICMPv6NeighborSolicitMinimumSize is the minimum size of a
 	// neighbor solicitation packet.
-	ICMPv6NeighborSolicitMinimumSize = ICMPv6MinimumSize + 16
+	ICMPv6NeighborSolicitMinimumSize = ICMPv6HeaderSize + NDPNSMinimumSize
+
+	// ICMPv6NeighborAdvertMinimumSize is the minimum size of a
+	// neighbor advertisement packet.
+	ICMPv6NeighborAdvertMinimumSize = ICMPv6HeaderSize + NDPNAMinimumSize
 
 	// ICMPv6NeighborAdvertSize is size of a neighbor advertisement.
-	ICMPv6NeighborAdvertSize = 32
+	// The extra 8 bytes is for the Target Link Layer address option.
+	ICMPv6NeighborAdvertSize = ICMPv6HeaderSize + NDPNAMinimumSize + 8
 
 	// ICMPv6EchoMinimumSize is the minimum size of a valid ICMP echo packet.
 	ICMPv6EchoMinimumSize = 8
@@ -164,6 +176,12 @@ func (b ICMPv6) Sequence() uint16 {
 // SetSequence sets the Sequence field from an ICMPv6 message.
 func (b ICMPv6) SetSequence(sequence uint16) {
 	binary.BigEndian.PutUint16(b[icmpv6SequenceOffset:], sequence)
+}
+
+// Body returns the ICMPv6 packet's body. That is, the portion of the
+// ICMPv6 buffer after the first ICMPv6HeaderSize bytes.
+func (b ICMPv6) Body() []byte {
+	return b[ICMPv6BodyOffset:]
 }
 
 // Payload implements Transport.Payload.
