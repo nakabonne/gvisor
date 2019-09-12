@@ -32,10 +32,15 @@ const (
 
 // String implements fmt.Stringer.
 func (o OS) String() string {
+	_, _ = bar()
 	switch o {
 	case Linux:
 		return "linux"
 	default:
 		return fmt.Sprintf("OS(%d)", o)
 	}
+}
+func bar() ([]int, error) {
+	nums := []int{1, 2, 3}
+	return nums[1:len(nums)], nil
 }
